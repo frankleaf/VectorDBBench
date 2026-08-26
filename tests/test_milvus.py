@@ -8,13 +8,21 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, call
 
 import pytest
-from pydantic import SecretStr
+from pydantic import SecretStr, ValidationError
 
 from vectordb_bench.backend.cases import CaseType
 from vectordb_bench.backend.clients import DB
 from vectordb_bench.backend.clients.api import IndexType
-from vectordb_bench.backend.clients.milvus.config import MilvusConfig
-from vectordb_bench.backend.clients.milvus.milvus import MILVUS_FORCE_MERGE_TARGET_SIZE_MB, Milvus
+from vectordb_bench.backend.clients.milvus.config import (
+    MILVUS_DEFAULT_FORCE_MERGE_TARGET_SIZE_MB,
+    AutoIndexConfig,
+    MilvusConfig,
+)
+from vectordb_bench.backend.clients.milvus.milvus import (
+    MILVUS_FORCE_MERGE_TARGET_SIZE_MB,
+    Milvus,
+    resolve_force_merge_target_size_mb,
+)
 from vectordb_bench.backend.payload import PayloadProfile
 from vectordb_bench.interface import BenchMarkRunner
 from vectordb_bench.models import CaseConfig, TaskConfig
@@ -29,11 +37,13 @@ class TestMilvusOptimize:
         compact_side_effect: Exception | None = None,
         is_fts: bool = False,
         is_gpu_index: bool = False,
+        force_merge_target_size_mb: int = MILVUS_FORCE_MERGE_TARGET_SIZE_MB,
     ):
         milvus = Milvus.__new__(Milvus)
         milvus.name = "Milvus"
         milvus.collection_name = "test_collection"
         milvus._is_fts = is_fts
+        milvus.force_merge_target_size_mb = force_merge_target_size_mb
         milvus.case_config = SimpleNamespace(is_gpu_index=is_gpu_index)
         milvus.client = MagicMock()
         milvus.client.compact.side_effect = compact_side_effect
@@ -50,6 +60,41 @@ class TestMilvusOptimize:
 
         milvus.client.compact.assert_any_call("test_collection", target_size=MILVUS_FORCE_MERGE_TARGET_SIZE_MB)
         milvus.client.refresh_load.assert_called_once_with("test_collection")
+
+    def test_optimize_compact_uses_configured_force_merge_target_size(self):
+        milvus = self._milvus(force_merge_target_size_mb=1024)
+
+        milvus._optimize()
+
+        assert milvus.client.compact.call_args_list == [
+            call("test_collection"),
+            call("test_collection", target_size=1024),
+        ]
+        milvus.client.refresh_load.assert_called_once_with("test_collection")
+
+    def test_force_merge_with_bounded_target_size_does_not_require_full_plan_coverage(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        # a bounded target size lets the server skip segments that already reached it,
+        # so a partial plan must not fail the run
+        sleeps = []
+        monkeypatch.setattr(
+            "vectordb_bench.backend.clients.milvus.milvus.time.sleep",
+            lambda seconds: sleeps.append(seconds),
+        )
+        milvus = self._milvus(force_merge_target_size_mb=1024)
+        milvus.client.list_persistent_segments.return_value = [
+            SimpleNamespace(segment_id=1, is_sorted=True, state_name="Flushed", level_name="L1"),
+            SimpleNamespace(segment_id=2, is_sorted=True, state_name="Flushed", level_name="L1"),
+        ]
+        milvus.client.get_compaction_plans.return_value = SimpleNamespace(plans=[SimpleNamespace(sources=[1])])
+
+        milvus._force_merge()
+
+        milvus.client.compact.assert_called_once_with("test_collection", target_size=1024)
+        milvus._wait_for_compaction.assert_called_once_with(42)
+        milvus.client.get_compaction_plans.assert_not_called()
+        assert sleeps == []
 
     def test_optimize_compacts_fts_collections(self):
         milvus = self._milvus(is_fts=True)
@@ -135,6 +180,7 @@ class TestMilvusOptimize:
         milvus.collection_name = "test_collection"
         milvus._is_fts = False
         milvus._main_index_name = "vector_idx"
+        milvus.force_merge_target_size_mb = MILVUS_FORCE_MERGE_TARGET_SIZE_MB
         milvus.case_config = SimpleNamespace(is_gpu_index=False)
         milvus.client = FakeMilvusClient()
         monkeypatch.setattr("vectordb_bench.backend.clients.milvus.milvus.time.sleep", lambda _seconds: None)
@@ -197,6 +243,7 @@ class TestMilvusOptimize:
         milvus.collection_name = "test_collection"
         milvus._is_fts = False
         milvus._main_index_name = "vector_idx"
+        milvus.force_merge_target_size_mb = MILVUS_FORCE_MERGE_TARGET_SIZE_MB
         milvus.case_config = SimpleNamespace(is_gpu_index=False)
         milvus.client = FakeMilvusClient()
         monkeypatch.setattr("vectordb_bench.backend.clients.milvus.milvus.time.sleep", lambda _seconds: None)
@@ -247,6 +294,7 @@ class TestMilvusOptimize:
         milvus.name = "Milvus"
         milvus.collection_name = "test_collection"
         milvus._main_index_name = "vector_idx"
+        milvus.force_merge_target_size_mb = MILVUS_FORCE_MERGE_TARGET_SIZE_MB
         milvus.client = FakeMilvusClient()
         monkeypatch.setattr("vectordb_bench.backend.clients.milvus.milvus.time.sleep", lambda _seconds: None)
 
@@ -282,6 +330,37 @@ class TestMilvusOptimize:
 
         assert exc_info.value is error
         milvus.client.refresh_load.assert_not_called()
+
+
+class TestMilvusForceMergeTargetSize:
+    def test_resolve_defaults_to_unbounded_size(self):
+        assert MILVUS_FORCE_MERGE_TARGET_SIZE_MB == MILVUS_DEFAULT_FORCE_MERGE_TARGET_SIZE_MB
+        assert resolve_force_merge_target_size_mb({}) == MILVUS_DEFAULT_FORCE_MERGE_TARGET_SIZE_MB
+        assert resolve_force_merge_target_size_mb({"force_merge_target_size_mb": "2048"}) == 2048
+
+    @pytest.mark.parametrize("raw", [0, -1, "abc", 1.5])
+    def test_resolve_rejects_invalid_values(self, raw: object):
+        with pytest.raises(ValueError, match="force merge target size must be a positive whole number of MB"):
+            resolve_force_merge_target_size_mb({"force_merge_target_size_mb": raw})
+
+    def test_config_exposes_target_size(self):
+        uri = SecretStr("http://localhost:19530")
+        default_config = MilvusConfig(uri=uri)
+        assert default_config.to_dict()["force_merge_target_size_mb"] == MILVUS_DEFAULT_FORCE_MERGE_TARGET_SIZE_MB
+        assert MilvusConfig(uri=uri, force_merge_target_size_mb="512").to_dict()["force_merge_target_size_mb"] == 512
+        with pytest.raises(ValidationError):
+            MilvusConfig(uri=uri, force_merge_target_size_mb=0)
+
+    def test_init_reads_target_size_from_db_config(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setattr("vectordb_bench.backend.clients.milvus.milvus.MilvusClient", MagicMock())
+
+        milvus = Milvus(
+            dim=8,
+            db_config={"uri": "http://localhost:19530", "force_merge_target_size_mb": 256},
+            db_case_config=AutoIndexConfig(),
+        )
+
+        assert milvus.force_merge_target_size_mb == 256
 
 
 @pytest.mark.integration

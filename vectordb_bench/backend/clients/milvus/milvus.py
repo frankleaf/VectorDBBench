@@ -12,13 +12,30 @@ from vectordb_bench.backend.filter import Filter, FilterOp
 from vectordb_bench.backend.payload import PayloadProfile
 
 from ..api import VectorDB
-from .config import MilvusFtsConfig, MilvusIndexConfig
+from .config import MILVUS_DEFAULT_FORCE_MERGE_TARGET_SIZE_MB, MilvusFtsConfig, MilvusIndexConfig
 
 log = logging.getLogger(__name__)
 
-MILVUS_FORCE_MERGE_TARGET_SIZE_MB = ((1 << 63) - 1) // (1024**2)
+MILVUS_FORCE_MERGE_TARGET_SIZE_MB = MILVUS_DEFAULT_FORCE_MERGE_TARGET_SIZE_MB
 MILVUS_FORCE_MERGE_MAX_ATTEMPTS = 10
 MILVUS_FORCE_MERGE_RETRY_INTERVAL_SECONDS = 30
+
+
+def resolve_force_merge_target_size_mb(db_config: dict | None) -> int:
+    """Resolve the force merge target size in MB, falling back to the unbounded default."""
+    raw = (db_config or {}).get("force_merge_target_size_mb")
+    if raw is None or raw == "":
+        return MILVUS_FORCE_MERGE_TARGET_SIZE_MB
+
+    message = f"force merge target size must be a positive whole number of MB, got {raw!r}"
+    try:
+        # str() first so fractional values are rejected instead of silently truncated
+        target_size_mb = int(str(raw))
+    except (TypeError, ValueError):
+        raise ValueError(message) from None
+    if target_size_mb <= 0:
+        raise ValueError(message)
+    return target_size_mb
 
 
 class Milvus(VectorDB):
@@ -52,6 +69,7 @@ class Milvus(VectorDB):
         self.case_config = db_case_config
         self.collection_name = collection_name
         self.with_scalar_labels = with_scalar_labels
+        self.force_merge_target_size_mb = resolve_force_merge_target_size_mb(db_config)
 
         self._scalar_label_field = "label"
         self._scalar_payload_label_field = self._scalar_label_field
@@ -326,10 +344,22 @@ class Milvus(VectorDB):
             message = "force merge max_attempts must be greater than zero"
             raise ValueError(message)
 
+        target_size_mb = self.force_merge_target_size_mb
+        # Only the unbounded default merges a collection into a single segment, so plan coverage
+        # can be verified. A smaller target size legitimately leaves segments that already reached
+        # it out of every plan, and there is nothing to retry, so run one compaction and stop.
+        if target_size_mb < MILVUS_FORCE_MERGE_TARGET_SIZE_MB:
+            log.info(f"{self.name} force merge with target size {target_size_mb} MB")
+            self._wait_for_compaction_ready()
+            compaction_id = self.client.compact(self.collection_name, target_size=target_size_mb)
+            if compaction_id > 0:
+                self._wait_for_compaction(compaction_id)
+            return
+
         for attempt in range(1, max_attempts + 1):
             self._wait_for_compaction_ready()
             expected_source_ids = self._force_merge_source_segment_ids()
-            compaction_id = self.client.compact(self.collection_name, target_size=MILVUS_FORCE_MERGE_TARGET_SIZE_MB)
+            compaction_id = self.client.compact(self.collection_name, target_size=target_size_mb)
             if compaction_id <= 0:
                 failure_detail = f"generated no plan for snapshot {sorted(expected_source_ids)}"
             else:

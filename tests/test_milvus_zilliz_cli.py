@@ -2,6 +2,7 @@ from click.testing import CliRunner
 from pytest import MonkeyPatch
 
 from vectordb_bench.backend.clients.milvus import cli as milvus_cli
+from vectordb_bench.backend.clients.milvus.config import MILVUS_DEFAULT_FORCE_MERGE_TARGET_SIZE_MB
 from vectordb_bench.backend.clients.zilliz_cloud import cli as zilliz_cli
 
 
@@ -25,9 +26,28 @@ def test_milvus_cli_builds_shared_connection_config() -> None:
     assert config.num_shards == 2
     assert config.replica_number == 3
     assert config.collection_name == "bench_collection"
+    assert config.force_merge_target_size_mb == MILVUS_DEFAULT_FORCE_MERGE_TARGET_SIZE_MB
 
     parameters["password"] = None
     assert milvus_cli._build_milvus_config(parameters).password is None
+
+
+def test_milvus_cli_force_merge_target_size_option(monkeypatch: MonkeyPatch) -> None:
+    captured = {}
+
+    def fake_run(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(milvus_cli, "run", fake_run)
+    base_args = ["--uri", "http://localhost:19530", "--dry-run"]
+
+    result = CliRunner().invoke(milvus_cli.MilvusAutoIndex, [*base_args, "--force-merge-target-size-mb", "1024"])
+    assert result.exit_code == 0, result.output
+    assert captured["db_config"].force_merge_target_size_mb == 1024
+
+    result = CliRunner().invoke(milvus_cli.MilvusAutoIndex, [*base_args, "--force-merge-target-size-mb", "0"])
+    assert result.exit_code != 0
+    assert "force-merge-target-size-mb" in result.output
 
 
 def test_milvus_autoindex_cli_enables_partition_key_for_multitenant_case(

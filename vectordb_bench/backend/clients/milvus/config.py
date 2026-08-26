@@ -1,8 +1,12 @@
 from typing import ClassVar
 
-from pydantic import BaseModel, SecretStr
+from pydantic import BaseModel, Field, SecretStr
 
 from ..api import DBCaseConfig, DBConfig, IndexType, MetricType, SQType
+
+# int64 max bytes expressed in MB, i.e. a practically unbounded target size that
+# lets force merge collapse all segments of a collection into a single one.
+MILVUS_DEFAULT_FORCE_MERGE_TARGET_SIZE_MB = ((1 << 63) - 1) // (1024**2)
 
 
 class MilvusConfig(DBConfig):
@@ -14,6 +18,7 @@ class MilvusConfig(DBConfig):
     num_shards: int = 1
     replica_number: int = 1
     collection_name: str = "VDBBench"
+    force_merge_target_size_mb: int = Field(default=MILVUS_DEFAULT_FORCE_MERGE_TARGET_SIZE_MB, gt=0)
 
     def to_dict(self) -> dict:
         return {
@@ -23,6 +28,7 @@ class MilvusConfig(DBConfig):
             "num_shards": self.num_shards,
             "replica_number": self.replica_number,
             "collection_name": self.collection_name,
+            "force_merge_target_size_mb": self.force_merge_target_size_mb,
         }
 
 

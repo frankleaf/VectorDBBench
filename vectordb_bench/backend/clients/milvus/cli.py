@@ -30,6 +30,11 @@ def _with_partition_key(db_case_config: BaseModel, parameters: dict) -> BaseMode
 def _build_milvus_config(parameters: dict) -> BaseModel:
     from .config import MilvusConfig
 
+    optional_params = {}
+    # omit the flag when unset so MilvusConfig keeps its own default (unbounded) target size
+    if parameters.get("force_merge_target_size_mb") is not None:
+        optional_params["force_merge_target_size_mb"] = int(parameters["force_merge_target_size_mb"])
+
     return MilvusConfig(
         db_label=parameters["db_label"],
         uri=SecretStr(parameters["uri"]),
@@ -38,6 +43,7 @@ def _build_milvus_config(parameters: dict) -> BaseModel:
         num_shards=int(parameters["num_shards"]),
         replica_number=int(parameters["replica_number"]),
         collection_name=parameters["collection_name"],
+        **optional_params,
     )
 
 
@@ -96,6 +102,19 @@ class MilvusTypedDict(TypedDict):
                 "Use the Milvus partition key on the label field. "
                 "Defaults to enabled for CloudMultiTenantSearchCase and disabled otherwise."
             ),
+        ),
+    ]
+    force_merge_target_size_mb: Annotated[
+        int | None,
+        click.option(
+            "--force-merge-target-size-mb",
+            type=click.IntRange(min=1),
+            help=(
+                "Target segment size in MB used by the force merge compaction before search. "
+                "Defaults to an unbounded size, merging each collection into a single segment."
+            ),
+            required=False,
+            default=None,
         ),
     ]
 
